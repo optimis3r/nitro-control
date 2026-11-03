@@ -1,0 +1,14 @@
+#!/usr/bin/python3 -E
+"""Restricted hardware commands exposed to the local desktop session."""
+import subprocess
+import sys
+
+import nitro
+
+if len(sys.argv) < 2 or sys.argv[1] not in {"mode", "profile", "firmware", "gpu-power"}:
+    sys.exit("Unsupported Nitro Control helper command.")
+
+try:
+    nitro.main()
+except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+    sys.exit(f"nitro: {error}")
