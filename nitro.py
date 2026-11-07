@@ -127,8 +127,31 @@ def pwm_channels():
         for control in sorted(device.glob("pwm[0-9]*_enable")):
             channel = control.stem.removesuffix("_enable")
             if re.fullmatch(r"pwm[0-9]+", channel) and (device / channel).is_file():
-                if control.stat().st_mode & 0o200:
-                    yield f"{device.name}/{channel}", device, control
+                try:
+                    if control.stat().st_mode & 0o200:
+                        yield f"{device.name}/{channel}", device, control
+                except FileNotFoundError:
+                    continue  # Devices can disappear during discovery.
+
+
+def pwm_controls():
+    """Describe standard channels without assuming fan order or driver names."""
+    channels = []
+    for name, device, control in pwm_channels():
+        channel = control.name.removesuffix("_enable")
+        mode = read_optional(control)
+        duty = device / channel
+        try:
+            writable = bool(duty.stat().st_mode & 0o200)
+            identity = str(device.resolve(strict=True))
+        except FileNotFoundError:
+            continue
+        channels.append({"id": name, "device": identity,
+                         "driver": read_optional(device / "name") or device.name,
+                         "label": read_optional(device / f"{channel}_label") or channel,
+                         "mode": mode, "manual": writable,
+                         "automatic": mode.isdigit() and int(mode) >= 2})
+    return channels
 
 
 def fan_rpm():
@@ -189,7 +212,19 @@ def require_acer():
 
 
 def driver_module():
-    return Path(__file__).resolve().parent / ".build" / os.uname().release / "linuwu_sense.ko"
+    local = Path(__file__).resolve().parent / ".build" / os.uname().release / "linuwu_sense.ko"
+    if local.is_file():
+        return local
+    try:
+        result = subprocess.run([system_command("modinfo"), "-n", "linuwu_sense"],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            installed = Path(result.stdout.strip())
+            if installed.is_file():
+                return installed
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        pass
+    return local
 
 
 def load_driver():
@@ -198,7 +233,7 @@ def load_driver():
         return
     module = driver_module()
     if not module.is_file():
-        raise RuntimeError("Build the driver for the running kernel with ./build-driver.sh first.")
+        raise RuntimeError("Install the driver with ./install.sh or build it with ./build-driver.sh first.")
     if (SYS / "module/linuwu_sense").exists():
         raise RuntimeError("Linuwu-Sense is loaded but did not expose fan control.")
     modprobe, insmod, rmmod = map(system_command, ("modprobe", "insmod", "rmmod"))
@@ -207,7 +242,11 @@ def load_driver():
         subprocess.run([modprobe, "-r", "acer_wmi"], check=True)
     try:
         subprocess.run([modprobe, "-a", "sparse_keymap", "wmi", "rfkill", "video"], check=True)
-        subprocess.run([insmod, str(module)], check=True)
+        if module.parent == Path(__file__).resolve().parent / ".build" / os.uname().release:
+            subprocess.run([insmod, str(module)], check=True)
+        else:
+            # modprobe supports DKMS modules, including compressed/signed modules.
+            subprocess.run([modprobe, "linuwu_sense"], check=True)
         if not FAN.exists():
             subprocess.run([rmmod, "linuwu_sense"], check=True)
             raise RuntimeError("The replacement driver did not expose fan control.")
@@ -259,10 +298,16 @@ def interrupt(signum, frame):
     raise KeyboardInterrupt
 
 
-def pwm_max(channel, seconds):
-    control = next((path for name, _, path in pwm_channels() if name == channel), None)
-    if control is None:
+def pwm_override(channel, seconds, percent=None, expected_device=None):
+    if not 1 <= seconds <= 300 or (percent is not None and not 60 <= percent <= 100):
+        raise RuntimeError("Use 1–300 seconds and 60–100 percent.")
+    selected = next(((device, path) for name, device, path in pwm_channels() if name == channel), None)
+    if selected is None:
         raise RuntimeError("Unknown PWM channel. Run 'status' to list current channels.")
+    device, control = selected
+    if expected_device is not None and str(device.resolve(strict=True)) != expected_device:
+        raise RuntimeError("The selected fan device changed. Refresh and select the channel again.")
+    duty = (device / control.name.removesuffix("_enable")).resolve(strict=True)
     control = control.resolve(strict=True)
     original = read(control)
     if not original.isdigit() or int(original) < 2:
@@ -270,8 +315,18 @@ def pwm_max(channel, seconds):
     sigint = signal.getsignal(signal.SIGINT)
     sigterm = signal.signal(signal.SIGTERM, interrupt)
     try:
-        write_confirmed(control, "0")
-        print(f"Requested full speed on {channel} for {seconds}s.", flush=True)
+        if percent is None:
+            try:
+                write_confirmed(control, "0")
+            except (OSError, RuntimeError):
+                # Some drivers expose manual/auto but do not implement mode 0.
+                write_confirmed(control, "1")
+                write_confirmed(duty, "255")
+        else:
+            write_confirmed(control, "1")
+            write_confirmed(duty, str(round(percent * 255 / 100)))
+        target = "full speed" if percent is None else f"{percent}%"
+        print(f"Requested {target} on {channel} for {seconds}s.", flush=True)
         time.sleep(seconds)
     finally:
         # Finish restoring the controller even if another termination signal arrives.
@@ -285,6 +340,10 @@ def pwm_max(channel, seconds):
             signal.signal(signal.SIGTERM, sigterm)
             signal.signal(signal.SIGINT, sigint)
         print(f"Restored {channel} to mode {original}.")
+
+
+def pwm_max(channel, seconds, expected_device=None):
+    pwm_override(channel, seconds, expected_device=expected_device)
 
 
 def fan_control(args):
@@ -352,7 +411,7 @@ def main():
     commands.add_parser("load-driver", help="load the built Acer driver for this boot")
     mode = commands.add_parser("mode", help="select a platform profile or Acer fan mode")
     mode.add_argument("name", choices=COOLING_PROFILES)
-    fan = commands.add_parser("fan", help="control Acer fans or test a Linux PWM channel")
+    fan = commands.add_parser("fan", help="control Acer fans or a standard Linux PWM channel")
     modes = fan.add_subparsers(dest="mode", required=True)
     modes.add_parser("auto", help="restore firmware fan control")
     for mode in ("max", "manual"):
@@ -364,6 +423,12 @@ def main():
     pwm = modes.add_parser("pwm-max", help="test one Linux hwmon PWM channel at full speed")
     pwm.add_argument("channel", help="channel from status, such as hwmon3/pwm1")
     pwm.add_argument("--seconds", default=15, type=bounded(1, 300))
+    pwm.add_argument("--device", help="expected resolved hwmon device path")
+    pwm_set = modes.add_parser("pwm-set", help="temporarily set a standard PWM fan speed")
+    pwm_set.add_argument("channel", help="channel from status, such as hwmon3/pwm1")
+    pwm_set.add_argument("percent", type=bounded(60, 100))
+    pwm_set.add_argument("--seconds", default=30, type=bounded(1, 300))
+    pwm_set.add_argument("--device", help="expected resolved hwmon device path")
     profile = commands.add_parser("profile", help="set an available platform profile")
     profile.add_argument("name")
     power = commands.add_parser("gpu-power", help="set an NVIDIA power limit in watts")
@@ -381,7 +446,7 @@ def main():
         set_power(args)
         return
     if args.command in {"firmware", "load-driver"} or (
-        args.command == "fan" and args.mode != "pwm-max"
+        args.command == "fan" and args.mode not in {"pwm-max", "pwm-set"}
     ):
         require_acer()
     with open("/run/nitro-control.lock", "a") as lock:
@@ -391,7 +456,9 @@ def main():
             raise RuntimeError("A fan or profile command is active. Stop it before retrying.") from error
         if args.command == "fan":
             if args.mode == "pwm-max":
-                pwm_max(args.channel, args.seconds)
+                pwm_max(args.channel, args.seconds, args.device)
+            elif args.mode == "pwm-set":
+                pwm_override(args.channel, args.seconds, args.percent, args.device)
             else:
                 fan_control(args)
         elif args.command == "mode":

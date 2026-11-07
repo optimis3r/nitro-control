@@ -25,6 +25,7 @@ fi
 install -d -o root -g root -m 0755 "$helper_dir"
 install -o root -g root -m 0644 nitro.py "$helper_dir/nitro.py"
 install -o root -g root -m 0755 nitro-helper "$helper_dir/nitro-helper"
+install -d -o root -g root -m 0755 /usr/share/polkit-1/actions /etc/polkit-1/rules.d
 staging=$(mktemp -d)
 trap 'rm -rf -- "$staging"' EXIT
 

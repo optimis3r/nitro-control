@@ -130,6 +130,7 @@ def sample():
     status = read_optional(battery / "status") if battery else ""
     snapshot["battery"] = f"{charge}% · {status}" if charge else ""
     snapshot["acer"] = nitro.acer_model()
+    snapshot["pwm"] = nitro.pwm_controls()
     snapshot["fan"] = read_optional(nitro.FAN) if snapshot["acer"] else ""
     profile, choices = nitro.platform_profile()
     snapshot["profile"] = read_optional(profile)
@@ -426,7 +427,70 @@ class Dashboard(Gtk.ApplicationWindow):
         self.load_button.set_visible(False)
         options = (wrap_items(*modes, columns=5, spacing=4) if self.popup
                    else box(*modes, spacing=4))
-        return card(label("Cooling mode", "title"), self.fan_state, options, self.load_button)
+        self.cooling_options = options
+        self.pwm_targets = {}
+        self.pwm_state = label("Looking for standard fan controls…", "muted")
+        target = self.dropdown("pwm")
+        target.set_hexpand(True)
+        target.update_property([Gtk.AccessibleProperty.LABEL], ["Fan channel"])
+        target.connect("notify::selected", lambda *_: self.pwm_selection_changed())
+        self.pwm_speed = Gtk.SpinButton.new_with_range(60, 100, 5)
+        self.pwm_speed.set_value(75)
+        self.pwm_speed.update_property([Gtk.AccessibleProperty.LABEL], ["Fan speed percent"])
+        self.pwm_seconds = Gtk.SpinButton.new_with_range(1, 300, 5)
+        self.pwm_seconds.set_value(15)
+        self.pwm_seconds.update_property([Gtk.AccessibleProperty.LABEL], ["Fan override duration in seconds"])
+        manual = self.action("Apply timed speed", "pwm_manual", lambda: self.pwm_command())
+        maximum = self.action("Timed full speed", "pwm", lambda: self.pwm_command(full=True))
+        self.pwm_section = box(label("Standard fan control", "title"), self.pwm_state, target,
+                               wrap_items(box(self.pwm_speed, label("%"), vertical=False, spacing=4),
+                                          box(self.pwm_seconds, label("seconds"), vertical=False, spacing=4),
+                                          manual, maximum, columns=4),
+                               label("Restores the original automatic mode when the timer ends.", "caption"))
+        self.pwm_section.add_css_class("settings-row")
+        return card(label("Cooling mode", "title"), self.fan_state, options, self.load_button,
+                    self.pwm_section)
+
+    def pwm_command(self, full=False):
+        target = self.pwm_targets[self.selected("pwm")]
+        arguments = ["fan", "pwm-max" if full else "pwm-set", target["id"]]
+        if not full:
+            arguments.append(str(self.pwm_speed.get_value_as_int()))
+        return arguments + ["--seconds", str(self.pwm_seconds.get_value_as_int()),
+                            "--device", target["device"]]
+
+    def pwm_selection_changed(self):
+        item = self.models["pwm"][0].get_selected_item()
+        target = self.pwm_targets.get(item.get_string()) if item else None
+        automatic = bool(target and target["automatic"])
+        manual = bool(automatic and target["manual"])
+        available = {"pwm": automatic, "pwm_manual": manual}
+        for widget, feature in self.controls:
+            if feature in available:
+                widget.set_sensitive(available[feature] and not self.busy)
+        self.pwm_speed.set_sensitive(manual and not self.busy)
+        self.pwm_seconds.set_sensitive(automatic and not self.busy)
+        if target:
+            state = (f"Automatic control · mode {target['mode']}" if automatic else
+                     "Not in automatic mode. Restore Auto in the app managing this fan before retrying.")
+        else:
+            state = "No writable standard fan channels detected. Controls depend on the loaded driver."
+        self.pwm_state.set_text(state)
+        return available
+
+    def render_pwm(self, data):
+        if not self.busy:
+            item = self.models["pwm"][0].get_selected_item()
+            previous = item.get_string() if item else ""
+            self.pwm_targets = {
+                f"{target['driver']} · {target['label']} ({target['id']})": target
+                for target in data["pwm"]
+            }
+            self.update_options("pwm", self.pwm_targets, previous)
+        else:
+            self.models["pwm"][0].set_sensitive(False)
+        self.pwm_section.set_visible(bool(data["pwm"]) or not data["fan"])
+        return self.pwm_selection_changed()
 
     def temperature_history(self):
         self.chart = Gtk.DrawingArea(content_height=112)
@@ -564,9 +628,10 @@ class Dashboard(Gtk.ApplicationWindow):
 
     def render_cooling(self, data):
         available = {"fan": bool(data["fan"]), "profile": bool(data["choices"])}
+        available.update(self.render_pwm(data))
         available["load"] = data["acer"] and not available["fan"] and nitro.driver_module().is_file()
         self.load_button.set_visible(available["load"])
-        detected = available["fan"] or available["profile"] or bool(data["rpm"])
+        detected = available["fan"] or available["profile"] or bool(data["rpm"]) or bool(data["pwm"])
         model = data.get("model")
         self.identity.set_text(f"Nitro Control  /  {model}" if model else "Nitro Control")
         self.badge.set_text("Hardware detected" if detected else "Fan controls offline")
@@ -582,7 +647,9 @@ class Dashboard(Gtk.ApplicationWindow):
             )
 
         choices = set(data["choices"])
+        self.cooling_options.set_visible(bool(state) or bool(choices))
         for name, widget in self.mode_buttons.items():
+            widget.set_visible(name not in {"auto", "max"} or bool(state) or data["acer"])
             aliases = nitro.COOLING_PROFILES[name]
             available[name] = bool(choices.intersection(aliases)) if aliases else bool(state)
             max_active = state == "100,100" and name == "max"
@@ -605,6 +672,9 @@ class Dashboard(Gtk.ApplicationWindow):
             message = "Driver available to load"
         elif profile:
             message = f"Platform profile · {profile}"
+        elif data["pwm"]:
+            count = len(data["pwm"])
+            message = f"Standard fan control · {count} {'channel' if count == 1 else 'channels'} detected"
         else:
             message = "Direct fan control unavailable"
         self.fan_state.set_text(message)
@@ -699,6 +769,7 @@ class Dashboard(Gtk.ApplicationWindow):
         if self.busy:
             return
         self.busy = True
+        self.models["pwm"][0].set_sensitive(False)
         for widget, _ in self.controls:
             widget.set_sensitive(False)
         use_helper = arguments[0] != "load-driver" and PRIVILEGED_HELPER.is_file()

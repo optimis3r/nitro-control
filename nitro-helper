@@ -6,7 +6,8 @@ import sys
 import nitro
 
 if len(sys.argv) < 2 or sys.argv[1] not in {"mode", "profile", "firmware", "gpu-power"}:
-    sys.exit("Unsupported Nitro Control helper command.")
+    if len(sys.argv) < 3 or sys.argv[1] != "fan" or sys.argv[2] not in {"pwm-max", "pwm-set"}:
+        sys.exit("Unsupported Nitro Control helper command.")
 
 try:
     nitro.main()
