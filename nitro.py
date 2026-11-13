@@ -3,6 +3,7 @@
 import argparse
 import csv
 import fcntl
+from functools import lru_cache
 import math
 import os
 import re
@@ -14,11 +15,10 @@ import sys
 import time
 
 SYS = Path("/sys")
+HELPER_API_VERSION = "2"
 ACER = SYS / "devices/platform/acer-wmi"
 FAN = ACER / "nitro_sense/fan_speed"
 COOLING_PROFILES = {
-    "auto": (),
-    "max": (),
     "quiet": ("quiet", "low-power"),
     "balanced": ("balanced",),
     "performance": ("performance", "balanced-performance"),
@@ -37,7 +37,7 @@ GPU_FIELDS = {
     "VRAM used (MiB)": "memory.used",
     "VRAM total (MiB)": "memory.total",
     "Draw (W)": "power.draw",
-    "Requested limit (W)": "gpu.power.requested_limit",
+    "Requested limit (W)": "power.limit",
     "Effective ceiling (W)": "enforced.power.limit",
     "Default limit (W)": "power.default_limit",
     "Minimum limit (W)": "power.min_limit",
@@ -105,6 +105,108 @@ def gpu(fields, index):
     return rows[0]
 
 
+@lru_cache(maxsize=32)
+def graphics_name(vendor, model, brand):
+    """Resolve a readable model using the local PCI database, without probing a GPU."""
+    for path in ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids", "/usr/share/pci.ids"):
+        database = read_optional(Path(path))
+        if not database:
+            continue
+        section = False
+        for line in database.splitlines():
+            if line and not line.startswith(("#", "\t")):
+                section = line.startswith(vendor.removeprefix("0x") + " ")
+            elif section and line.startswith("\t" + model.removeprefix("0x") + " "):
+                name = line.strip().split(None, 1)[1]
+                friendly = re.findall(r"\[([^]]+)\]", name)
+                return f"{brand} {friendly[-1] if friendly else name}"
+    return f"{brand} graphics"
+
+
+def graphics_stats(device):
+    hwmon = next(iter((device / "hwmon").glob("hwmon*")), device / "hwmon")
+    stats = []
+    for path, scale, unit in (
+        (hwmon / "temp1_input", 1000, "°C"),
+        (device / "gpu_busy_percent", 1, "% load"),
+        (hwmon / "freq1_input", 1000000, "MHz"),
+        (device / "mem_info_vram_used", 1048576, "MiB VRAM used"),
+        (hwmon / "power1_input", 1000000, "W package" if read_optional(hwmon / "power1_label") == "PPT" else "W"),
+    ):
+        try:
+            value = float(read(path)) / scale
+            if math.isfinite(value):
+                stats.append(f"{value:.4g} {unit}")
+        except (OSError, ValueError):
+            pass
+    return " · ".join(stats)
+
+
+def graphics_devices():
+    """Inspect PCI without waking GPUs or requiring a vendor utility."""
+    devices = []
+    for device in sorted((SYS / "bus/pci/devices").glob("*")):
+        if not read_optional(device / "class").startswith("0x03"):
+            continue
+        vendor = read_optional(device / "vendor")
+        name = {"0x10de": "NVIDIA", "0x1002": "AMD", "0x8086": "Intel"}.get(vendor, "GPU")
+        driver = device / "driver"
+        bound = driver.is_symlink()
+        runtime = read_optional(device / "power/runtime_status")
+        power = read_optional(device / "power_state")
+        state = ("powered down" if runtime in {"suspended", "suspending"} or power in {"D3cold", "D3hot"}
+                 else "driver unavailable" if not bound else "available")
+        devices.append({"id": device.name, "vendor": name, "state": state,
+                        "name": graphics_name(vendor, read_optional(device / "device"), name),
+                        "stats": graphics_stats(device) if state == "available" else ""})
+    return devices
+
+
+def gpu_telemetry(index=0):
+    devices = [device for device in graphics_devices() if device["vendor"] == "NVIDIA"]
+    if not devices:
+        return [], "NVIDIA GPU not detected (it may be disabled in firmware)."
+    # nvidia-smi indices cannot safely be mapped to PCI order on multi-GPU systems.
+    # Skip polling while any NVIDIA device is asleep rather than wake it accidentally.
+    if any(device["state"] != "available" for device in devices):
+        return [], "NVIDIA GPU " + ", ".join(sorted({device["state"] for device in devices})) + "."
+    try:
+        return gpu(tuple(GPU_FIELDS.values()), index), "NVIDIA telemetry available."
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        return [], f"NVIDIA telemetry unavailable: {error}"
+
+
+def acer_fan_values():
+    value = read_optional(FAN)
+    if not re.fullmatch(r"\d{1,3},\d{1,3}", value):
+        raise RuntimeError("Cannot read Acer fan settings. Refresh or reload the driver.")
+    values = list(map(int, value.split(",")))
+    if any(value > 100 for value in values):
+        raise RuntimeError("Invalid Acer fan settings reported by the driver.")
+    return values
+
+
+def fans():
+    """One inventory for CLI and desktop; never infer ownership from discovery order."""
+    readings = list(sensor_readings("fan"))
+    result = []
+    if acer_fans_available():
+        values = acer_fan_values()
+        for index, name in enumerate(("cpu", "gpu"), start=1):
+            rpm = next((row[-1] for row in readings
+                        if row[0].resolve().is_relative_to(ACER.resolve())
+                        and row[2].name == f"fan{index}_input"), "")
+            result.append({"id": name, "label": f"{name.upper()} fan", "backend": "acer",
+                           "rpm": rpm, "setting": values[index - 1]})
+        readings = [row for row in readings if not row[0].resolve().is_relative_to(ACER.resolve())]
+    for target in pwm_controls():
+        result.append({**target, "backend": "pwm", "rpm": ""})
+    for device, driver, channel, label, rpm in readings:
+        result.append({"id": f"{device.name}/{channel.stem}", "label": f"{driver} · {label}",
+                       "backend": "sensor", "rpm": rpm})
+    return result
+
+
 def platform_profile():
     devices = []
     for device in sorted((SYS / "class/platform-profile").glob("platform-profile-*")):
@@ -154,11 +256,6 @@ def pwm_controls():
     return channels
 
 
-def fan_rpm():
-    for device, driver, _, label, value in sensor_readings("fan"):
-        print(f"  {device.name} ({driver}) {label}  {value} RPM")
-
-
 def acer_model():
     dmi = SYS / "class/dmi/id"
     return (read_optional(dmi / "sys_vendor"), read_optional(dmi / "product_name")) == (
@@ -178,25 +275,23 @@ def status(index):
         print(f"  {device.name} ({driver}) {label}  {int(value) / 1000:.1f} °C")
     if not temperatures and (cpu := cpu_temperature(temperatures)):
         print(f"CPU temperature  {int(cpu) / 1000:.1f} °C")
-    if acer_fans_available():
-        print(f"Fan setting (CPU,GPU)  {read_optional(FAN) or 'unavailable'}")
-    fan_rpm()
-    channels = [f"{name} ({read_optional(device / 'name')})"
-                for name, device, _ in pwm_channels()]
-    if channels:
-        print(f"PWM channels  {', '.join(channels)}")
-    elif not acer_fans_available():
+    detected = fans()
+    for fan in detected:
+        state = ("Auto" if fan.get("setting") == 0 else f"{fan['setting']}%") if fan["backend"] == "acer" else (
+            "timed PWM control" if fan["backend"] == "pwm" else "monitor only")
+        rpm = f" · {fan['rpm']} RPM" if fan["rpm"] else ""
+        print(f"Fan {fan['id']}  {fan['label']} · {state}{rpm}")
+    if not any(fan["backend"] != "sensor" for fan in detected):
         print("Direct fan control  Unavailable")
     profile, choices = platform_profile()
     if profile.exists() and choices.exists():
         print(f"Platform profile  {read(profile)} ({read(choices)})")
     else:
         print("Platform profile  Unavailable")
-    try:
-        values = gpu(tuple(GPU_FIELDS.values()), index)
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-        print(f"NVIDIA telemetry unavailable: {error}")
-        return
+    for device in graphics_devices():
+        print(f"{device['name']}  {device['stats'] or device['state']}")
+    values, message = gpu_telemetry(index)
+    print(message)
     for label, value in zip(GPU_FIELDS, values):
         print(f"{label}  {value}")
 
@@ -211,42 +306,19 @@ def require_acer():
         raise RuntimeError("Acer firmware writes are restricted to the Nitro ANV15-41.")
 
 
-def driver_module():
-    local = Path(__file__).resolve().parent / ".build" / os.uname().release / "linuwu_sense.ko"
-    if local.is_file():
-        return local
-    try:
-        result = subprocess.run([system_command("modinfo"), "-n", "linuwu_sense"],
-                                capture_output=True, text=True, timeout=5)
-        if result.returncode == 0 and result.stdout.strip():
-            installed = Path(result.stdout.strip())
-            if installed.is_file():
-                return installed
-    except (OSError, RuntimeError, subprocess.TimeoutExpired):
-        pass
-    return local
-
-
 def load_driver():
     if FAN.exists():
         print("Acer fan driver is already active.")
         return
-    module = driver_module()
-    if not module.is_file():
-        raise RuntimeError("Install the driver with ./install.sh or build it with ./build-driver.sh first.")
     if (SYS / "module/linuwu_sense").exists():
         raise RuntimeError("Linuwu-Sense is loaded but did not expose fan control.")
-    modprobe, insmod, rmmod = map(system_command, ("modprobe", "insmod", "rmmod"))
+    modprobe, rmmod = map(system_command, ("modprobe", "rmmod"))
     stock_loaded = (SYS / "module/acer_wmi").exists()
     if stock_loaded:
         subprocess.run([modprobe, "-r", "acer_wmi"], check=True)
     try:
         subprocess.run([modprobe, "-a", "sparse_keymap", "wmi", "rfkill", "video"], check=True)
-        if module.parent == Path(__file__).resolve().parent / ".build" / os.uname().release:
-            subprocess.run([insmod, str(module)], check=True)
-        else:
-            # modprobe supports DKMS modules, including compressed/signed modules.
-            subprocess.run([modprobe, "linuwu_sense"], check=True)
+        subprocess.run([modprobe, "linuwu_sense"], check=True)
         if not FAN.exists():
             subprocess.run([rmmod, "linuwu_sense"], check=True)
             raise RuntimeError("The replacement driver did not expose fan control.")
@@ -264,34 +336,46 @@ def set_fans(cpu, graphics):
         raise RuntimeError(f"Fan driver did not confirm {value}")
 
 
+def set_fan(channel, value, seconds=None):
+    """Acer has a paired register: preserve the other channel on every write."""
+    if not acer_fans_available():
+        raise RuntimeError("Acer fan control unavailable. Run ./install.sh and check 'nitro status'.")
+    if channel not in {"cpu", "gpu"} or value not in (0, *range(20, 101)):
+        raise RuntimeError("Choose cpu/gpu and Auto (0) or 20–100 percent.")
+    if seconds is not None and not 1 <= seconds <= 300:
+        raise RuntimeError("Use 1–300 seconds.")
+    index = 0 if channel == "cpu" else 1
+    values = acer_fan_values()
+    values[index] = value
+    if seconds is None:
+        set_fans(*values)
+        print(f"{channel.upper()} fan: {'Auto' if value == 0 else str(value) + '%'}.")
+        return
+    sigint = signal.getsignal(signal.SIGINT)
+    sigterm = signal.signal(signal.SIGTERM, interrupt)
+    try:
+        set_fans(*values)
+        print(f"{channel.upper()} fan: {value}% for {seconds}s.", flush=True)
+        time.sleep(seconds)
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            values = acer_fan_values()
+            values[index] = 0
+            set_fans(*values)
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(f"Could not restore {channel} Auto: {error}. Run 'fan auto'.") from error
+        finally:
+            signal.signal(signal.SIGINT, sigint)
+            signal.signal(signal.SIGTERM, sigterm)
+        print(f"{channel.upper()} fan restored to Auto.")
+
+
 def write_confirmed(setting, value):
     setting.write_text(value + "\n")
     if read(setting) != value:
         raise RuntimeError(f"The driver did not confirm {value} for {setting.name}.")
-
-
-def cooling_mode(mode):
-    if mode in {"max", "auto"} and not acer_fans_available():
-        raise RuntimeError("This mode requires the supported Acer fan interface.")
-    if mode == "max":
-        set_fans(100, 100)
-        print("Max active. Both fans requested at full speed.")
-        return
-    if mode == "auto":
-        set_fans(0, 0)
-        print("Firmware Auto active. The current platform profile is retained.")
-        return
-    setting, choices = platform_profile()
-    if not choices.exists() or not setting.exists():
-        raise RuntimeError("Platform profile unavailable.")
-    available = read(choices).split()
-    name = next((item for item in COOLING_PROFILES[mode] if item in available), None)
-    if name is None:
-        raise RuntimeError(f"The driver does not expose a profile for {mode}.")
-    if acer_fans_available():
-        set_fans(0, 0)
-    write_confirmed(setting, name)
-    print(f"{mode.capitalize()} active · platform profile {name}.")
 
 
 def interrupt(signum, frame):
@@ -299,8 +383,8 @@ def interrupt(signum, frame):
 
 
 def pwm_override(channel, seconds, percent=None, expected_device=None):
-    if not 1 <= seconds <= 300 or (percent is not None and not 60 <= percent <= 100):
-        raise RuntimeError("Use 1–300 seconds and 60–100 percent.")
+    if not 1 <= seconds <= 300 or (percent is not None and not 20 <= percent <= 100):
+        raise RuntimeError("Use 1–300 seconds and 20–100 percent.")
     selected = next(((device, path) for name, device, path in pwm_channels() if name == channel), None)
     if selected is None:
         raise RuntimeError("Unknown PWM channel. Run 'status' to list current channels.")
@@ -342,32 +426,6 @@ def pwm_override(channel, seconds, percent=None, expected_device=None):
         print(f"Restored {channel} to mode {original}.")
 
 
-def pwm_max(channel, seconds, expected_device=None):
-    pwm_override(channel, seconds, expected_device=expected_device)
-
-
-def fan_control(args):
-    if not FAN.exists():
-        raise RuntimeError("Fan interface unavailable. See README.md for the driver trial.")
-    if args.mode == "auto":
-        set_fans(0, 0)
-        print("Firmware Auto requested.")
-        return
-    cpu, graphics = (100, 100) if args.mode == "max" else (args.cpu, args.graphics)
-    signal.signal(signal.SIGTERM, interrupt)
-    try:
-        set_fans(cpu, graphics)
-        print(f"CPU {cpu}%, GPU {graphics}% for {args.seconds}s. Ctrl+C returns to Auto.", flush=True)
-        fan_rpm()
-        time.sleep(args.seconds)
-    finally:
-        try:
-            set_fans(0, 0)
-            print("Firmware Auto requested.")
-        except (OSError, RuntimeError) as error:
-            raise RuntimeError(f"Could not restore Auto: {error}. Run 'fan auto' immediately.") from error
-
-
 def set_power(args):
     index = args.gpu_index
     default, minimum, maximum = gpu(
@@ -380,7 +438,7 @@ def set_power(args):
     if not (all(map(math.isfinite, (lower, upper, baseline, watts))) and lower <= watts <= upper):
         raise RuntimeError(f"Power limit must be between {lower:g} and {upper:g} W.")
     print(nvidia("-i", str(index), "--power-limit", f"{watts:g}"))
-    requested, effective = gpu(("gpu.power.requested_limit", "enforced.power.limit"), index)
+    requested, effective = gpu(("power.limit", "enforced.power.limit"), index)
     print(f"Requested {requested} W | effective ceiling {effective} W")
     if not any(matches_watts(value, watts) for value in (requested, effective)):
         raise RuntimeError("The driver accepted the command, but telemetry did not confirm the target.")
@@ -408,25 +466,21 @@ def main():
     parser.add_argument("--gpu-index", default=0, type=int)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status", help="show temperatures and available controls")
-    commands.add_parser("load-driver", help="load the built Acer driver for this boot")
-    mode = commands.add_parser("mode", help="select a platform profile or Acer fan mode")
-    mode.add_argument("name", choices=COOLING_PROFILES)
+    commands.add_parser("load-driver", help="load the installed Acer driver")
     fan = commands.add_parser("fan", help="control Acer fans or a standard Linux PWM channel")
     modes = fan.add_subparsers(dest="mode", required=True)
+    single = modes.add_parser("set", help="change one Acer fan without changing the other")
+    single.add_argument("channel", choices=("cpu", "gpu"))
+    single.add_argument("percent", type=lambda value: 0 if value.lower() == "auto" else bounded(20, 100, True)(value))
+    single.add_argument("--seconds", type=bounded(1, 300), help="return this fan to Auto after 1–300 seconds")
     modes.add_parser("auto", help="restore firmware fan control")
-    for mode in ("max", "manual"):
-        options = modes.add_parser(mode)
-        options.add_argument("--seconds", default=30, type=bounded(1, 300))
-        if mode == "manual":
-            options.add_argument("cpu", type=bounded(60, 100, allow_auto=True))
-            options.add_argument("graphics", type=bounded(60, 100, allow_auto=True))
     pwm = modes.add_parser("pwm-max", help="test one Linux hwmon PWM channel at full speed")
     pwm.add_argument("channel", help="channel from status, such as hwmon3/pwm1")
     pwm.add_argument("--seconds", default=15, type=bounded(1, 300))
     pwm.add_argument("--device", help="expected resolved hwmon device path")
     pwm_set = modes.add_parser("pwm-set", help="temporarily set a standard PWM fan speed")
     pwm_set.add_argument("channel", help="channel from status, such as hwmon3/pwm1")
-    pwm_set.add_argument("percent", type=bounded(60, 100))
+    pwm_set.add_argument("percent", type=bounded(20, 100))
     pwm_set.add_argument("--seconds", default=30, type=bounded(1, 300))
     pwm_set.add_argument("--device", help="expected resolved hwmon device path")
     profile = commands.add_parser("profile", help="set an available platform profile")
@@ -455,14 +509,15 @@ def main():
         except BlockingIOError as error:
             raise RuntimeError("A fan or profile command is active. Stop it before retrying.") from error
         if args.command == "fan":
-            if args.mode == "pwm-max":
-                pwm_max(args.channel, args.seconds, args.device)
+            if args.mode == "set":
+                set_fan(args.channel, args.percent, args.seconds)
+            elif args.mode == "pwm-max":
+                pwm_override(args.channel, args.seconds, expected_device=args.device)
             elif args.mode == "pwm-set":
                 pwm_override(args.channel, args.seconds, args.percent, args.device)
             else:
-                fan_control(args)
-        elif args.command == "mode":
-            cooling_mode(args.name)
+                set_fans(0, 0)
+                print("Firmware Auto requested.")
         elif args.command == "load-driver":
             load_driver()
         elif args.command == "firmware":

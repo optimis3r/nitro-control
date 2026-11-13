@@ -1,255 +1,130 @@
 # Nitro Control for Linux
 
-## Install everything
+A small GTK app and CLI for independent laptop fan control, performance
+profiles, GPU telemetry and supported Acer firmware settings.
 
-From your desktop account, run:
+## Install
+
+Download and extract this repository, or clone it:
 
 ```bash
+git clone https://github.com/optimis3r/nitro-control.git
+cd nitro-control
 ./install.sh
 ```
 
-The installer requests sudo, installs distribution dependencies, copies the
-app and artwork into `/usr/local/lib/nitro-control`, registers **Nitro
-Control** in the application menu, and configures the privileged helper
-for your active local desktop session. Launch it from the menu or with
-`nitro-control`; use `nitro status` for the CLI. The project folder is no
-longer needed after installation. Rerun the same command to update the app.
+Run from your normal desktop account. The installer requests sudo, installs
+system packages and desktop permissions, and adds **Nitro Control** to the app
+menu. Launch with `nitro-control`; inspect hardware with `nitro status`.
+Rerun the installer to update.
 
-Automatic dependency installation supports Arch Linux, Debian/Ubuntu and
-Fedora, with Python 3.9 or newer. An internet connection and access to the
-distribution package repositories are required. On Arch, update your system
-normally before installing. If the running kernel's headers are no longer
-available after an update, reboot into the installed kernel and rerun.
+Automatic installation supports **Arch Linux, Debian/Ubuntu and Fedora**, with
+Python 3.9+, internet access and distribution repositories. The desktop uses
+GTK 4, libadwaita and PyGObject. No pip environment is needed. Source launches
+may request authentication through your desktop Polkit agent.
 
 On the **Acer Nitro ANV15-41**, installation also builds the pinned
-Linuwu-Sense driver with DKMS, loads and verifies it immediately, and
-enables `nitro-control-driver.service` to load it at boot. DKMS rebuilds
-the module on kernel upgrades when matching headers are installed. A
-driver load failure restores the stock driver and leaves the boot service
-disabled. Secure Boot systems may require enrolling the DKMS signing key
-before the kernel will accept the module; installation reports failure
-instead of claiming hardware setup succeeded.
+[Linuwu-Sense driver](https://github.com/0x7375646F/Linuwu-Sense/tree/4483b6c38b9bb963ac9ada9ca476578e0c63cc08)
+with DKMS, verifies fan control and enables loading at boot. This requires
+systemd and headers matching the running kernel. DKMS rebuilds for kernel
+updates when matching headers are installed. If headers for an old running
+kernel are unavailable after an update, reboot and rerun installation.
+Secure Boot may require enrolling the DKMS signing key. A failed load restores
+the stock driver where it was previously loaded and leaves boot loading disabled.
 
-Other models receive the app and use their existing kernel interfaces.
-To install the app without changing drivers on the supported Acer, run
-`./install.sh --without-driver`. This option leaves any previously
-installed driver setup in place.
+Other laptops use existing Linux drivers; unverified vendor modules are not
+installed. To update the app and helper without changing drivers:
 
-For Hyprland installations with `~/.config/hypr/hyprland.conf`, the
-installer adds F23 and Super+Shift+F23 shortcuts for Quick Controls and
-migrates the old project-folder bindings. Original configuration files
-are backed up with a `.before-nitro-control` suffix. Reload Hyprland or
-log in again to activate them.
+```bash
+./install.sh --without-driver
+```
 
-To remove the installed app, its permissions, shortcuts and managed driver:
+To remove the app, permissions and managed driver:
 
 ```bash
 ./install.sh --remove
 ```
 
-Removal restores firmware Auto and the stock Acer driver where applicable.
-Distribution packages installed as dependencies are kept. Desktop setup
-and cleanup apply to the account running the installer; the app and
-driver installation are system-wide.
+Removal requests Acer Auto and restores the stock driver when this installer
+owned its setup. Installed distribution packages are kept. App and driver setup
+are system-wide; desktop setup applies to the installing account. On Hyprland,
+F23 and Super+Shift+F23 open Quick Controls. Edited configuration files receive
+`.before-nitro-control` backups; reload Hyprland to activate the shortcuts.
 
-## Driver compatibility
+## Controls
 
-The app follows the [Linux hwmon interface](https://docs.kernel.org/hwmon/sysfs-interface.html)
-and discovers capabilities instead of requiring a particular driver
-name. It reads temperatures and fan RPM from Linux hwmon drivers, offers
-the platform profiles reported by the kernel, and exposes standard PWM
-fan channels in the desktop app. Channels are identified by driver,
-label and channel ID; their order does not imply CPU or GPU ownership.
+Sections: **Fans → Performance → GPU → Battery and Keyboard → Graphics**.
 
-In **Cooling → Standard fan control**, choose a detected channel, a speed
-from 60–100%, and a duration from 1–300 seconds. **Apply timed speed**
-temporarily uses manual PWM control. **Timed full speed** requests full
-speed, with a manual 100% fallback for drivers without full-speed mode.
-Both restore the channel's original automatic mode when the timer ends
-or the command receives Ctrl+C/SIGTERM. Channels already under manual
-control are left to their existing controller. The selected physical
-device is checked again before a desktop command to detect hotplug changes.
+- **Fans:** each Acer fan has immediate Auto, Quiet (20%), Balanced (50%) and
+  Performance (100%) toggles. A change preserves the other fan's request.
+  Manual settings remain after closing the app; Auto returns control to firmware.
+- **Performance:** Quiet, Balanced and Performance (max), where the driver
+  exposes corresponding profiles. Acer profile changes can reset both fans to Auto.
+- **GPU:** Quiet requests 75% of the default power limit, clamped to the driver
+  minimum; Balanced restores the default; Performance requests the driver maximum.
+  Firmware may reject changes or enforce its own ceiling.
+- **Battery and Keyboard:** charge limit, keyboard timeout and off-state USB
+  charging appear only when supported by the Acer driver.
+- **Graphics:** GPU names, temperature, load, clock, memory and power readings
+  where available. Names use NVIDIA telemetry or the local PCI database, with
+  a vendor-name fallback. AMD package power is labelled separately from GPU power.
 
-The same controls are available from the CLI:
+Hardware refreshes every two seconds. CPU fan controls remain available when
+the GPU is off or lacks a driver. Suspended NVIDIA GPUs are not polled, although
+a power-state change can race with a poll. A GPU hidden from Linux is reported
+as not detected; this cannot reliably distinguish firmware disabling from absence.
+Fan availability is independent of GPU activity. Zero RPM means stopped.
+
+Other laptops show standard writable
+[Linux hwmon PWM channels](https://docs.kernel.org/hwmon/sysfs-interface.html)
+with individual timed controls. Driver labels are retained rather than assuming
+CPU/GPU ownership. RPM-only sensors are monitor only. Timed overrides require
+an automatic starting mode and restore it after 1–300 seconds, Ctrl+C or SIGTERM.
+Driver readback confirms a request; RPM or audible response confirms rotation.
+Forced termination, device removal or firmware failure can prevent restoration;
+reboot if control cannot be recovered. Timed operations serialize hardware changes.
+
+## GPU drivers
+
+**CPU and Acer fan control do not require an NVIDIA graphics driver.** NVIDIA
+telemetry and power controls require a working driver and `nvidia-smi`.
+Follow your distribution's installation guide:
+
+- [Arch Linux](https://wiki.archlinux.org/title/NVIDIA)
+- [Ubuntu](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/)
+- [Debian](https://wiki.debian.org/NvidiaGraphicsDrivers)
+- [Fedora / RPM Fusion](https://rpmfusion.org/Howto/NVIDIA)
+
+The installer does not install or switch GPU drivers. Keep a deliberately
+disabled GPU disabled. AMD and Intel use their distribution/kernel drivers.
+A graphics driver alone does not add laptop fan control; that requires a
+compatible firmware driver or writable hwmon interface.
+
+## CLI and source
+
+Status needs no sudo; hardware changes do:
 
 ```bash
 nitro status
-sudo nitro fan pwm-set hwmon3/pwm1 75 --seconds 30
-sudo nitro fan pwm-max hwmon3/pwm1 --seconds 15
+sudo nitro fan set cpu 20               # CPU Quiet; retain GPU request
+sudo nitro fan set gpu 50               # GPU Balanced; retain CPU request
+sudo nitro fan set cpu auto
+sudo nitro fan set cpu 100 --seconds 30  # Restore only CPU to Auto afterwards
+sudo nitro fan auto                     # Both Acer fans to Auto
+sudo nitro fan pwm-set hwmon3/pwm1 50 --seconds 30
+sudo nitro fan pwm-max hwmon3/pwm2 --seconds 15
+sudo nitro profile balanced             # Choose a name reported by status
+sudo nitro gpu-power 45                 # Watts, within live driver limits
+sudo nitro gpu-power default
 ```
 
-Use the channel ID reported on your machine. Firmware or the driver can
-reject individual modes or writes; the app reports that failure and
-attempts to restore the original automatic mode. A forced kill or device
-removal can prevent restoration; reboot if control cannot be recovered.
+Use PWM IDs from your current status output; they can change after reboot or
+reload. The desktop rechecks the device identity before a PWM write.
 
-This supports drivers implementing the standard Linux interfaces, not
-every possible vendor protocol. A driver exposing only RPM cannot gain
-fan-speed controls through app installation. Vendor-specific interfaces
-need a dedicated backend; Acer firmware options and automatic installation
-of Linuwu-Sense remain restricted to the verified ANV15-41 model. Other
-drivers are supplied and selected by the kernel/distribution; the installer
-does not guess or install arbitrary vendor modules. NVIDIA power controls
-still require a working NVIDIA driver with `nvidia-smi`.
+`nitro.py` contains hardware discovery and the CLI; `nitro_gui.py` is the desktop;
+`nitro-helper` restricts privileged desktop commands. `install.sh` handles all setup.
+To run from source, use `python3 nitro.py status` or `python3 nitro_gui.py`.
 
-## CLI and manual driver trial
-
-Nitro Control discovers the sensors and controls exposed by the running
-Linux kernel. The CLI requires Python 3.9 or newer and uses the standard
-library. Desktop and privileged operations have additional dependencies
-described below.
-
-```bash
-python3 nitro.py status
-```
-
-Status runs without sudo and lists available hwmon temperatures, fan RPM,
-PWM channels, platform profiles, and optional NVIDIA telemetry. Features
-vary with the laptop, firmware, loaded drivers, and kernel configuration.
-A system can expose RPM or platform profiles without exposing direct fan
-control. If no control interface exists, the app reports it as unavailable.
-
-If status lists a platform profile, select a reported name, such as
-`balanced`:
-
-```bash
-sudo python3 nitro.py profile balanced
-```
-
-### Test a standard Linux PWM channel
-
-Use the channel identifier shown by the current status output and check
-the accompanying driver name. These identifiers can change after a reboot
-or driver reload.
-
-```bash
-sudo python3 nitro.py fan pwm-max hwmon3/pwm1 --seconds 15
-```
-
-The test requires the channel to start in an automatic mode and its
-driver to accept standard hwmon full-speed or manual PWM control. It restores the
-original mode when the timer ends, on Ctrl+C, or on SIGTERM. If the
-process is forcibly killed, reboot to reset the controller. Check
-tachometer readings or listen for spin-up to confirm the physical fan
-response.
-
-## Enable the optional Acer Nitro ANV15-41 driver
-
-The stock module on the target machine exposes neither fan control nor
-platform profiles. The pinned [Linuwu-Sense source](https://github.com/0x7375646F/Linuwu-Sense/blob/4483b6c38b9bb963ac9ada9ca476578e0c63cc08/src/linuwu_sense.c)
-has an explicit match for the ANV15-41. The build uses Git, the kernel
-build toolchain and headers for the running kernel. It compiles without
-sudo and produces a module for that kernel under `.build`.
-
-```bash
-./build-driver.sh
-sudo modprobe -r acer_wmi &&
-  { { sudo modprobe -a sparse_keymap wmi rfkill video &&
-      sudo insmod ".build/$(uname -r)/linuwu_sense.ko"; } ||
-    sudo modprobe acer_wmi; }
-./nitro.py status
-```
-
-Load the dependencies after removing the stock module. Arch can unload
-`sparse_keymap` along with `acer_wmi`, and `insmod` does not load dependencies.
-
-Stop here if removal of `acer_wmi` fails. If Linuwu-Sense fails to load
-or the fan interface is missing, use the rollback below and capture
-`sudo journalctl -k -b -n 80`. This trial changes the running driver
-until reboot. Rebuild after a kernel upgrade.
-
-## Verify the fans and set a profile
-
-Start with a short maximum-speed test at idle. Check for audible spin-up
-and RPM changes if the driver publishes tachometer readings. The fan
-setting in status is driver readback of the request. RPM or audible
-spin-up is the physical check.
-
-```bash
-sudo ./nitro.py fan max --seconds 15
-sudo ./nitro.py fan manual 75 85 --seconds 30
-sudo ./nitro.py fan auto
-```
-
-Manual values are CPU then GPU, from 60 to 100 percent. Use 0 to leave a
-channel under firmware control. Manual and maximum modes last up to 300
-seconds and request firmware Auto when they finish, on Ctrl+C, or on
-SIGTERM. After a forced kill or if the command reports a failed reset,
-run `sudo ./nitro.py fan auto`.
-
-## GPU power
-
-The driver reported a 50 W default and a 65 W maximum on this machine.
-The program reads the live limits for every change and NVIDIA decides
-whether a write is supported. Acer firmware can apply its own ceiling.
-
-```bash
-sudo ./nitro.py gpu-power 45
-sudo ./nitro.py gpu-power default
-```
-
-## Roll back the trial
-
-End any active manual fan command first. If the fan interface is present,
-request Auto before unloading the module.
-
-```bash
-sudo ./nitro.py fan auto
-sudo rmmod linuwu_sense
-sudo modprobe acer_wmi
-```
-
-Rebooting also restores the normal driver. The build and trial do not
-install startup services or change the boot configuration.
-
-## Desktop app
-
-After `./install.sh`, open **Nitro Control** from the application menu or
-run `nitro-control`. For development directly from the project folder:
-
-```bash
-python3 nitro_gui.py
-python3 nitro_gui.py --install-launcher
-```
-
-The app uses GTK 4, libadwaita, PyGObject and Pycairo. Desktop writes
-require `pkexec` and a desktop Polkit agent. The included permissions
-installer expects standard Polkit directories and Python at
-`/usr/bin/python3`. The CLI also works without a desktop or Polkit.
-On Arch the required libraries are provided by `gtk4`, `libadwaita`,
-`python-gobject` and `python-cairo`.
-
-Cooling shows up to two fan RPM readings, available CPU and GPU
-temperatures and usage, and a rolling temperature chart. The main window
-loads the GPU and rotor artwork from the bundled `assets/` directory. Quiet, Balanced and Performance select
-the corresponding platform profiles where available. Auto and sustained
-Max use the supported Acer driver. On that model, **Load Acer driver**
-appears when a build exists for the running kernel and the fan interface
-is offline. Standard PWM controls are available in the desktop app and CLI
-for drivers exposing the corresponding Linux interfaces.
-
-System shows the available performance profiles and NVIDIA power
-controls. It also exposes the Acer battery charge limit, keyboard
-backlight timeout and off-state USB charging where the driver reports
-them.
-
-The full installer configures permissions automatically. To update only
-the privileged helper during development, run from the account using the app:
-
-```bash
-sudo ./install-permissions.sh
-```
-
-This installs a root-owned helper and permits the active local desktop
-session for that account to change cooling modes, performance profiles,
-GPU power, and the supported Acer firmware options. Loading the kernel
-driver still requires authentication. Rerun the installer to update the
-helper after backend changes. To revoke access, run
-`sudo ./install-permissions.sh --remove`.
-
-On Hyprland, the installed Copilot binding opens **Nitro Quick Controls**. Press it
-again or press Esc to close. The user keybinds accept Super+Shift+F23 and
-bare F23. The popup can also be toggled with `nitro-control --popup`
-(or `python3 nitro_gui.py --popup` during development).
-It runs as your desktop user and uses the same Polkit helper as the main
-window for hardware changes.
+After backend changes, rerun `./install.sh --without-driver` and reopen the app
+to update the root-owned helper. This also resolves **Unsupported Nitro Control
+helper command** or **outdated helper** errors from an older installed copy.

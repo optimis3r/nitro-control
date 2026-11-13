@@ -32,6 +32,52 @@ staging=$(mktemp -d)
 trap 'rm -rf -- "$staging"' EXIT
 trap 'echo "Installation did not finish. Fix the error above and rerun ./install.sh." >&2' ERR
 
+configure_permissions() {
+    helper_dir=/usr/local/lib/nitro-control
+    policy=/usr/share/polkit-1/actions/io.local.NitroControl.policy
+    rule=/etc/polkit-1/rules.d/49-nitro-control.rules
+
+    if [[ ${1:-} == --remove ]]; then
+        rm -f -- "$rule" "$policy" "$helper_dir/nitro-helper" "$helper_dir/nitro.py"
+        echo "Nitro Control desktop permission removed."
+        return
+    fi
+
+    install -d -o root -g root -m 0755 "$helper_dir"
+    install -o root -g root -m 0755 nitro-helper "$helper_dir/nitro-helper"
+    install -d -o root -g root -m 0755 /usr/share/polkit-1/actions /etc/polkit-1/rules.d
+    cat > "$staging/policy" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD polkit Policy Configuration 1.0//EN"
+"http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="io.local.NitroControl.settings">
+    <description>Change Nitro Control hardware settings</description>
+    <message>Authentication is required to change Nitro Control settings</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>no</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/nitro-control/nitro-helper</annotate>
+  </action>
+</policyconfig>
+XML
+
+    cat > "$staging/rule" <<JS
+polkit.addRule(function(action, subject) {
+    if (action.id === "io.local.NitroControl.settings" &&
+        subject.local && subject.active && subject.user === "$SUDO_USER") {
+        return polkit.Result.YES;
+    }
+});
+JS
+
+    install -o root -g root -m 0644 "$staging/policy" "$policy"
+    install -o root -g root -m 0644 "$staging/rule" "$rule"
+    echo "Nitro Control settings enabled for the active local session of $SUDO_USER."
+}
+
 # Run desktop configuration as the account owner, never as root.
 desktop_setup() {
     sudo -H -u "$SUDO_USER" /usr/bin/python3 - "$1" <<'PY'
@@ -99,7 +145,7 @@ if [[ $mode == --remove ]]; then
     rm -f -- "/etc/systemd/system/$unit"
     rm -rf -- "/usr/src/nitro-control-$driver_version"
     if [[ -d /run/systemd/system ]]; then systemctl daemon-reload; fi
-    ./install-permissions.sh --remove
+    configure_permissions --remove
     desktop_setup remove
     rm -f -- /usr/local/bin/nitro-control /usr/local/bin/nitro \
         /usr/local/share/applications/io.local.NitroControl.desktop
@@ -119,7 +165,7 @@ fi
 . /etc/os-release
 case " $ID ${ID_LIKE:-} " in
     *' arch '*)
-        packages=(python gtk4 libadwaita python-gobject python-cairo polkit)
+        packages=(python gtk4 libadwaita python-gobject polkit)
         if $install_driver; then
             # pkgbase identifies linux, linux-lts, linux-zen and custom kernels.
             if [[ -r /usr/lib/modules/$kernel/pkgbase ]]; then
@@ -133,13 +179,13 @@ case " $ID ${ID_LIKE:-} " in
         pacman -S --needed --noconfirm "${packages[@]}"
         ;;
     *' debian '*|*' ubuntu '*)
-        packages=(python3 python3-gi python3-gi-cairo python3-cairo gir1.2-gtk-4.0 gir1.2-adw-1 pkexec polkitd)
+        packages=(python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 pkexec polkitd)
         if $install_driver; then packages+=(git build-essential dkms kmod "linux-headers-$kernel"); fi
         apt-get update
         apt-get install -y "${packages[@]}"
         ;;
     *' fedora '*)
-        packages=(python3 python3-gobject python3-cairo gtk4 libadwaita polkit)
+        packages=(python3 python3-gobject gtk4 libadwaita polkit)
         if $install_driver; then packages+=(git gcc make dkms kmod "kernel-devel-$kernel"); fi
         dnf install -y "${packages[@]}"
         ;;
@@ -149,12 +195,10 @@ esac
 import sys
 if sys.version_info < (3, 9):
     sys.exit("Nitro Control requires Python 3.9 or newer.")
-import cairo
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gtk, Adw, GdkPixbuf
+from gi.repository import Gtk, Adw
 PY
 command -v pkexec >/dev/null
 
@@ -186,10 +230,9 @@ DKMS
     depmod -a "$kernel"
 fi
 
-install -d -o root -g root -m 0755 "$app_dir/assets" /usr/local/bin /usr/local/share/applications
+install -d -o root -g root -m 0755 "$app_dir" /usr/local/bin /usr/local/share/applications
 install -o root -g root -m 0644 nitro.py nitro_gui.py "$app_dir/"
-install -o root -g root -m 0644 assets/*.png "$app_dir/assets/"
-./install-permissions.sh
+configure_permissions
 cat > "$staging/nitro-control" <<'SH'
 #!/bin/sh
 exec /usr/bin/python3 -E /usr/local/lib/nitro-control/nitro_gui.py "$@"
